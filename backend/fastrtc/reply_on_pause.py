@@ -129,12 +129,15 @@ class ReplyOnPause(StreamHandler):
         # 确保有一个空音频流以便传递给回调函数
         if self.state.stream is None:
             empty_audio = np.zeros(self.output_sample_rate, dtype=np.int16)
-            self.state.stream = empty_audio
-            self.state.sampling_rate = self.output_sample_rate
+            audio_input = (self.output_sample_rate, empty_audio, self.state.trigger_source, msg)
         # 设置暂停检测标志
         self.state.pause_detected = True
         self.event.set()
-        self.emit()
+        if self._needs_additional_inputs:
+            self.latest_args = [audio_input]
+            return self.fn(*self.latest_args)
+        else:
+            return self.fn(audio_input)
 
     def start_up(self):
         if self.startup_fn:
