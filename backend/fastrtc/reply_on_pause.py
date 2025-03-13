@@ -14,6 +14,11 @@ from .utils import create_message, split_output
 
 logger = getLogger(__name__)
 
+@dataclass
+class TriggerSource:
+    """表示触发响应的来源"""
+    VAD = "vad"  # 通过VAD检测到停顿触发
+    PROACTIVE = "proactive"  # 主动触发
 
 @dataclass
 class AlgoOptions:
@@ -35,6 +40,8 @@ class AppState:
     buffer: np.ndarray | None = None
     responded_audio: bool = False
     interrupted: asyncio.Event = field(default_factory=asyncio.Event)
+    trigger_source: TriggerSource = TriggerSource.VAD
+    trigger_msg: str = ""
 
     def new(self):
         return AppState()
@@ -104,6 +111,31 @@ class ReplyOnPause(StreamHandler):
     def _needs_additional_inputs(self) -> bool:
         return len(inspect.signature(self.fn).parameters) > 1
 
+    def interrupt_response(self):
+        if self.can_interrupt and self.state.responding:
+            self._close_generator()
+            self.generator = None
+        if self.can_interrupt:
+            self.clear_queue()
+
+    def trigger_response(self, msg=""):
+        """触发响应
+        Args:
+            msg: 消息体
+        """            
+        # 记录触发源
+        self.state.trigger_msg = msg
+        self.state.trigger_source = TriggerSource.PROACTIVE
+        # 确保有一个空音频流以便传递给回调函数
+        if self.state.stream is None:
+            empty_audio = np.zeros(self.output_sample_rate, dtype=np.int16)
+            self.state.stream = empty_audio
+            self.state.sampling_rate = self.output_sample_rate
+        # 设置暂停检测标志
+        self.state.pause_detected = True
+        self.interrupt_response()
+        self.event.set()
+
     def start_up(self):
         if self.startup_fn:
             if self._needs_additional_inputs:
@@ -132,6 +164,8 @@ class ReplyOnPause(StreamHandler):
         self, audio: np.ndarray, sampling_rate: int, state: AppState
     ) -> bool:
         """Take in the stream, determine if a pause happened"""
+        if state.trigger_source == TriggerSource.PROACTIVE:
+            return True
         duration = len(audio) / sampling_rate
 
         if duration >= self.algo_options.audio_chunk_duration:
@@ -143,11 +177,7 @@ class ReplyOnPause(StreamHandler):
             ):
                 state.started_talking = True
                 logger.debug("Started talking")
-                if self.can_interrupt and self.state.responding:
-                    self._close_generator()
-                    self.generator = None
-                if self.can_interrupt:
-                    self.clear_queue()
+                self.interrupt_response()
             if state.started_talking:
                 if state.stream is None:
                     state.stream = audio
@@ -226,13 +256,14 @@ class ReplyOnPause(StreamHandler):
                 logger.debug("Creating generator")
                 audio = cast(np.ndarray, self.state.stream).reshape(1, -1)
                 if self._needs_additional_inputs:
-                    self.latest_args[0] = (self.state.sampling_rate, audio)
+                    self.latest_args[0] = (self.state.sampling_rate, audio, self.state.trigger_source, self.state.trigger_msg)
                     self.generator = self.fn(*self.latest_args)  # type: ignore
                 else:
-                    self.generator = self.fn((self.state.sampling_rate, audio))  # type: ignore
+                    self.generator = self.fn((self.state.sampling_rate, audio, self.state.trigger_source, self.state.trigger_msg))  # type: ignore
                 logger.debug("Latest args: %s", self.latest_args)
                 self.state = self.state.new()
             self.state.responding = True
+            self.state.trigger_source = TriggerSource.VAD
             try:
                 if self.is_async:
                     output = asyncio.run_coroutine_threadsafe(
