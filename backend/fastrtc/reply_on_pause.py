@@ -133,7 +133,6 @@ class ReplyOnPause(StreamHandler):
             self.state.sampling_rate = self.output_sample_rate
         # 设置暂停检测标志
         self.state.pause_detected = True
-        self.interrupt_response()
         self.event.set()
 
     def start_up(self):
@@ -165,6 +164,7 @@ class ReplyOnPause(StreamHandler):
     ) -> bool:
         """Take in the stream, determine if a pause happened"""
         if state.trigger_source == TriggerSource.PROACTIVE:
+            self.interrupt_response()
             return True
         duration = len(audio) / sampling_rate
 
