@@ -138,8 +138,6 @@ class ReplyOnPause(StreamHandler):
         self, audio: np.ndarray, sampling_rate: int, state: AppState
     ) -> bool:
         """Take in the stream, determine if a pause happened"""
-        if state.trigger_source == TriggerSource.PROACTIVE:
-            return True
         duration = len(audio) / sampling_rate
 
         if duration >= self.algo_options.audio_chunk_duration:
@@ -237,7 +235,6 @@ class ReplyOnPause(StreamHandler):
                 logger.debug("Latest args: %s", self.latest_args)
                 self.state = self.state.new()
             self.state.responding = True
-            self.state.trigger_source = TriggerSource.VAD
             try:
                 if self.is_async:
                     output = asyncio.run_coroutine_threadsafe(
