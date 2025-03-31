@@ -115,7 +115,7 @@ class ReplyOnPause(StreamHandler):
             if self._needs_additional_inputs:
                 self.wait_for_args_sync()
                 args = self.latest_args[1:]
-                self.args_set.is_set()
+                self.args_set.set()
             else:
                 args = ()
             self.generator = self.startup_fn(*args)
