@@ -8,9 +8,11 @@ import logging
 import tempfile
 import traceback
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Callable, Literal, Protocol, TypedDict, cast
 
 import av
+import librosa
 import numpy as np
 from numpy.typing import NDArray
 from pydub import AudioSegment
@@ -31,6 +33,11 @@ class AdditionalOutputs:
         self.args = args
 
 
+class CloseStream:
+    def __init__(self, msg: str = "Stream closed") -> None:
+        self.msg = msg
+
+
 class DataChannel(Protocol):
     def send(self, message: str) -> None: ...
 
@@ -38,6 +45,7 @@ class DataChannel(Protocol):
 def create_message(
     type: Literal[
         "send_input",
+        "end_stream",
         "fetch_output",
         "stopword",
         "error",
@@ -52,6 +60,22 @@ def create_message(
 current_channel: ContextVar[DataChannel | None] = ContextVar(
     "current_channel", default=None
 )
+
+
+@dataclass
+class Context:
+    webrtc_id: str
+
+
+current_context: ContextVar[Context | None] = ContextVar(
+    "current_context", default=None
+)
+
+
+def get_current_context() -> Context:
+    if not (ctx := current_context.get()):
+        raise RuntimeError("No context found")
+    return ctx
 
 
 def _send_log(message: str, type: str) -> None:
@@ -97,8 +121,12 @@ class WebRTCError(Exception):
         _send_log(message, "error")
 
 
-def split_output(data: tuple | Any) -> tuple[Any, AdditionalOutputs | None]:
+def split_output(
+    data: tuple | Any,
+) -> tuple[Any, AdditionalOutputs | CloseStream | None]:
     if isinstance(data, AdditionalOutputs):
+        return None, data
+    if isinstance(data, CloseStream):
         return None, data
     if isinstance(data, tuple):
         # handle the bare audio case
@@ -108,11 +136,11 @@ def split_output(data: tuple | Any) -> tuple[Any, AdditionalOutputs | None]:
             raise ValueError(
                 "The tuple must have exactly two elements: the data and an instance of AdditionalOutputs."
             )
-        if not isinstance(data[-1], AdditionalOutputs):
+        if not isinstance(data[-1], (AdditionalOutputs, CloseStream)):
             raise ValueError(
                 "The last element of the tuple must be an instance of AdditionalOutputs."
             )
-        return data[0], cast(AdditionalOutputs, data[1])
+        return data[0], cast(AdditionalOutputs | CloseStream, data[1])
     return data, None
 
 
@@ -134,7 +162,7 @@ async def player_worker_decode(
         rate=sample_rate,
         frame_size=frame_size,
     )
-
+    first_sample_rate = None
     while not thread_quit.is_set():
         try:
             # Get next frame
@@ -151,6 +179,8 @@ async def player_worker_decode(
                 cast(DataChannel, channel()).send(create_message("fetch_output", []))
 
             if frame is None:
+                if isinstance(outputs, CloseStream):
+                    await queue.put(outputs)
                 if quit_on_none:
                     await queue.put(None)
                     break
@@ -174,25 +204,36 @@ async def player_worker_decode(
                 layout,  # type: ignore
             )
             format = "s16" if audio_array.dtype == "int16" else "fltp"  # type: ignore
+            if first_sample_rate is None:
+                first_sample_rate = sample_rate
+
+            if format == "s16":
+                audio_array = audio_to_float32((sample_rate, audio_array))
+
+            if first_sample_rate != sample_rate:
+                audio_array = librosa.resample(
+                    audio_array, target_sr=first_sample_rate, orig_sr=sample_rate
+                )
 
             if audio_array.ndim == 1:
                 audio_array = audio_array.reshape(1, -1)
 
-            # Convert to audio frame and resample
+            # Convert to audio frame and
+
             # This runs in the same timeout context
             frame = av.AudioFrame.from_ndarray(  # type: ignore
                 audio_array,  # type: ignore
-                format=format,
+                format="fltp",
                 layout=layout,  # type: ignore
             )
-            frame.sample_rate = sample_rate
-
+            frame.sample_rate = first_sample_rate
             for processed_frame in audio_resampler.resample(frame):
                 processed_frame.pts = audio_samples
                 processed_frame.time_base = audio_time_base
                 audio_samples += processed_frame.samples
                 await queue.put(processed_frame)
-
+            if isinstance(outputs, CloseStream):
+                await queue.put(outputs)
         except (TimeoutError, asyncio.TimeoutError):
             logger.warning(
                 "Timeout in frame processing cycle after %s seconds - resetting", 60

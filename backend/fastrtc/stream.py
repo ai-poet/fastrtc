@@ -5,6 +5,7 @@ from typing import (
     AsyncContextManager,
     Callable,
     Literal,
+    Optional,
     TypedDict,
     cast,
 )
@@ -28,7 +29,8 @@ curr_dir = Path(__file__).parent
 
 
 class Body(BaseModel):
-    sdp: str
+    sdp: Optional[str] = None
+    candidate: Optional[dict[str, Any]] = None
     type: str
     webrtc_id: str
 
@@ -46,6 +48,11 @@ class UIArgs(TypedDict):
     """Color of the pulse animation. Default is var(--color-accent) of the demo theme."""
     icon_radius: NotRequired[int]
     """Border radius of the icon button expressed as a percentage of the button size. Default is 50%."""
+    send_input_on: NotRequired[Literal["submit", "change"]]
+    """When to send the input to the handler. Default is "change".
+    If "submit", the input will be sent when the submit event is triggered by the user.
+    If "change", the input will be sent whenever the user changes the input value.
+    """
 
 
 class Stream(WebRTCConnectionMixin):
@@ -70,8 +77,11 @@ class Stream(WebRTCConnectionMixin):
         self.rtp_params = rtp_params
         self.event_handler = handler
         self.concurrency_limit = cast(
-            (int | float),
+            (int),
             1 if concurrency_limit in ["default", None] else concurrency_limit,
+        )
+        self.concurrency_limit_gradio = cast(
+            int | Literal["default"] | None, concurrency_limit
         )
         self.time_limit = time_limit
         self.additional_output_components = additional_outputs
@@ -81,13 +91,17 @@ class Stream(WebRTCConnectionMixin):
         self._ui = self._generate_default_ui(ui_args)
         self._ui.launch = self._wrap_gradio_launch(self._ui.launch)
 
-    def mount(self, app: FastAPI):
-        app.router.post("/webrtc/offer")(self.offer)
-        app.router.websocket("/telephone/handler")(self.telephone_handler)
-        app.router.post("/telephone/incoming")(self.handle_incoming_call)
-        app.router.websocket("/websocket/offer")(self.websocket_offer)
+    def mount(self, app: FastAPI, path: str = ""):
+        from fastapi import APIRouter
+
+        router = APIRouter(prefix=path)
+        router.post("/webrtc/offer")(self.offer)
+        router.websocket("/telephone/handler")(self.telephone_handler)
+        router.post("/telephone/incoming")(self.handle_incoming_call)
+        router.websocket("/websocket/offer")(self.websocket_offer)
         lifespan = self._inject_startup_message(app.router.lifespan_context)
         app.router.lifespan_context = lifespan
+        app.include_router(router)
 
     @staticmethod
     def print_error(env: Literal["colab", "spaces"]):
@@ -225,11 +239,13 @@ class Stream(WebRTCConnectionMixin):
                     trigger=button.click,
                     time_limit=self.time_limit,
                     concurrency_limit=self.concurrency_limit,  # type: ignore
+                    send_input_on=ui_args.get("send_input_on", "change"),
                 )
                 if additional_output_components:
                     assert self.additional_outputs_handler
                     output_video.on_additional_outputs(
                         self.additional_outputs_handler,
+                        concurrency_limit=self.concurrency_limit_gradio,  # type: ignore
                         inputs=additional_output_components,
                         outputs=additional_output_components,
                     )
@@ -271,11 +287,13 @@ class Stream(WebRTCConnectionMixin):
                     outputs=[output_video],
                     time_limit=self.time_limit,
                     concurrency_limit=self.concurrency_limit,  # type: ignore
+                    send_input_on=ui_args.get("send_input_on", "change"),
                 )
                 if additional_output_components:
                     assert self.additional_outputs_handler
                     output_video.on_additional_outputs(
                         self.additional_outputs_handler,
+                        concurrency_limit=self.concurrency_limit_gradio,  # type: ignore
                         inputs=additional_output_components,
                         outputs=additional_output_components,
                     )
@@ -321,6 +339,7 @@ class Stream(WebRTCConnectionMixin):
                     outputs=[image],
                     time_limit=self.time_limit,
                     concurrency_limit=self.concurrency_limit,  # type: ignore
+                    send_input_on=ui_args.get("send_input_on", "change"),
                 )
                 if additional_output_components:
                     assert self.additional_outputs_handler
@@ -328,6 +347,7 @@ class Stream(WebRTCConnectionMixin):
                         self.additional_outputs_handler,
                         inputs=additional_output_components,
                         outputs=additional_output_components,
+                        concurrency_limit=self.concurrency_limit_gradio,  # type: ignore
                     )
         elif self.modality == "audio" and self.mode == "receive":
             with gr.Blocks() as demo:
@@ -373,6 +393,7 @@ class Stream(WebRTCConnectionMixin):
                     trigger=button.click,
                     time_limit=self.time_limit,
                     concurrency_limit=self.concurrency_limit,  # type: ignore
+                    send_input_on=ui_args.get("send_input_on", "change"),
                 )
                 if additional_output_components:
                     assert self.additional_outputs_handler
@@ -380,6 +401,7 @@ class Stream(WebRTCConnectionMixin):
                         self.additional_outputs_handler,
                         inputs=additional_output_components,
                         outputs=additional_output_components,
+                        concurrency_limit=self.concurrency_limit_gradio,  # type: ignore
                     )
         elif self.modality == "audio" and self.mode == "send":
             with gr.Blocks() as demo:
@@ -424,6 +446,7 @@ class Stream(WebRTCConnectionMixin):
                     outputs=[image],
                     time_limit=self.time_limit,
                     concurrency_limit=self.concurrency_limit,  # type: ignore
+                    send_input_on=ui_args.get("send_input_on", "change"),
                 )
                 if additional_output_components:
                     assert self.additional_outputs_handler
@@ -431,6 +454,7 @@ class Stream(WebRTCConnectionMixin):
                         self.additional_outputs_handler,
                         inputs=additional_output_components,
                         outputs=additional_output_components,
+                        concurrency_limit=self.concurrency_limit_gradio,  # type: ignore
                     )
         elif self.modality == "audio" and self.mode == "send-receive":
             with gr.Blocks() as demo:
@@ -476,6 +500,7 @@ class Stream(WebRTCConnectionMixin):
                         outputs=[image],
                         time_limit=self.time_limit,
                         concurrency_limit=self.concurrency_limit,  # type: ignore
+                        send_input_on=ui_args.get("send_input_on", "change"),
                     )
                     if additional_output_components:
                         assert self.additional_outputs_handler
@@ -483,9 +508,12 @@ class Stream(WebRTCConnectionMixin):
                             self.additional_outputs_handler,
                             inputs=additional_output_components,
                             outputs=additional_output_components,
+                            concurrency_limit=self.concurrency_limit_gradio,  # type: ignore
                         )
         elif self.modality == "audio-video" and self.mode == "send-receive":
-            with gr.Blocks() as demo:
+            css = """.my-group {max-width: 600px !important; max-height: 600 !important;}
+            .my-column {display: flex !important; justify-content: center !important; align-items: center !important};"""
+            with gr.Blocks(css=css) as demo:
                 gr.HTML(
                     f"""
                 <h1 style='text-align: center'>
@@ -502,8 +530,8 @@ class Stream(WebRTCConnectionMixin):
                 """
                     )
                 with gr.Row():
-                    with gr.Column():
-                        with gr.Group():
+                    with gr.Column(elem_classes=["my-column"]):
+                        with gr.Group(elem_classes=["my-group"]):
                             image = WebRTC(
                                 label="Stream",
                                 rtc_configuration=self.rtc_configuration,
@@ -528,6 +556,7 @@ class Stream(WebRTCConnectionMixin):
                         outputs=[image],
                         time_limit=self.time_limit,
                         concurrency_limit=self.concurrency_limit,  # type: ignore
+                        send_input_on=ui_args.get("send_input_on", "change"),
                     )
                     if additional_output_components:
                         assert self.additional_outputs_handler
@@ -535,6 +564,7 @@ class Stream(WebRTCConnectionMixin):
                             self.additional_outputs_handler,
                             inputs=additional_output_components,
                             outputs=additional_output_components,
+                            concurrency_limit=self.concurrency_limit_gradio,  # type: ignore
                         )
         else:
             raise ValueError(f"Invalid modality: {self.modality} and mode: {self.mode}")
@@ -623,6 +653,7 @@ class Stream(WebRTCConnectionMixin):
         **kwargs,
     ):
         import atexit
+        import inspect
         import secrets
         import threading
         import time
@@ -646,9 +677,18 @@ class Stream(WebRTCConnectionMixin):
         )
         t.start()
 
-        url = setup_tunnel(
-            host, port, share_token=secrets.token_urlsafe(32), share_server_address=None
-        )
+        # Check if setup_tunnel accepts share_server_tls_certificate parameter
+        setup_tunnel_params = inspect.signature(setup_tunnel).parameters
+        tunnel_kwargs = {
+            "local_host": host,
+            "local_port": port,
+            "share_token": secrets.token_urlsafe(32),
+            "share_server_address": None,
+        }
+        if "share_server_tls_certificate" in setup_tunnel_params:
+            tunnel_kwargs["share_server_tls_certificate"] = None
+
+        url = setup_tunnel(**tunnel_kwargs)
         host = urllib.parse.urlparse(url).netloc
 
         URL = "https://api.fastrtc.org"

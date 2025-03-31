@@ -21,9 +21,11 @@ from .tracks import (
     AudioVideoStreamHandler,
     StreamHandler,
     VideoEmitType,
+    VideoStreamHandler,
 )
 from .utils import (
     AdditionalOutputs,
+    CloseStream,
     Warning,
     WebRTCError,
     aggregate_bytes_to_16bit,
@@ -32,6 +34,7 @@ from .utils import (
     audio_to_file,
     audio_to_float32,
     audio_to_int16,
+    get_current_context,
     wait_for_item,
 )
 from .webrtc import (
@@ -73,4 +76,7 @@ __all__ = [
     "PauseDetectionModel",
     "get_silero_model",
     "SileroVadOptions",
+    "VideoStreamHandler",
+    "CloseStream",
+    "get_current_context",
 ]

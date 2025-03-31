@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fractions
 import functools
 import inspect
 import logging
@@ -11,10 +12,12 @@ import time
 import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import (
     Any,
     Generator,
     Literal,
+    Tuple,
     TypeAlias,
     Union,
     cast,
@@ -29,15 +32,18 @@ from aiortc import (
     VideoStreamTrack,
 )
 from aiortc.contrib.media import AudioFrame, VideoFrame  # type: ignore
-from aiortc.mediastreams import MediaStreamError
+from aiortc.mediastreams import VIDEO_CLOCK_RATE, VIDEO_TIME_BASE, MediaStreamError
 from numpy import typing as npt
 
 from fastrtc.utils import (
     AdditionalOutputs,
+    CloseStream,
+    Context,
     DataChannel,
     WebRTCError,
     create_message,
     current_channel,
+    current_context,
     player_worker_decode,
     split_output,
 )
@@ -51,9 +57,21 @@ VideoNDArray: TypeAlias = Union[
 ]
 
 VideoEmitType = (
-    VideoNDArray | tuple[VideoNDArray, AdditionalOutputs] | AdditionalOutputs
+    VideoNDArray
+    | tuple[VideoNDArray, AdditionalOutputs]
+    | tuple[VideoNDArray, CloseStream]
+    | AdditionalOutputs
+    | CloseStream
 )
-VideoEventHandler = Callable[[npt.ArrayLike], VideoEmitType]
+VideoEventGenerator = Generator[VideoEmitType, None, None]
+VideoEventHandler = Callable[[npt.ArrayLike], VideoEmitType | VideoEventGenerator]
+
+
+@dataclass
+class VideoStreamHandler:
+    callable: VideoEventHandler
+    fps: int = 30
+    skip_frames: bool = False
 
 
 class VideoCallback(VideoStreamTrack):
@@ -67,11 +85,14 @@ class VideoCallback(VideoStreamTrack):
         self,
         track: MediaStreamTrack,
         event_handler: VideoEventHandler,
+        context: Context,
         channel: DataChannel | None = None,
         set_additional_outputs: Callable | None = None,
         mode: Literal["send-receive", "send"] = "send-receive",
+        fps: int = 30,
+        skip_frames: bool = False,
     ) -> None:
-        super().__init__()  # don't forget this!
+        super().__init__()
         self.track = track
         self.event_handler = event_handler
         self.latest_args: str | list[Any] = "not_set"
@@ -81,10 +102,17 @@ class VideoCallback(VideoStreamTrack):
         self.mode = mode
         self.channel_set = asyncio.Event()
         self.has_started = False
+        self.fps = fps
+        self.frame_ptime = 1.0 / fps
+        self.skip_frames = skip_frames
+        self.frame_queue: asyncio.Queue[VideoFrame] = asyncio.Queue()
+        self.latest_frame = None
+        self.context = context
 
     def set_channel(self, channel: DataChannel):
         self.channel = channel
         current_channel.set(channel)
+        current_context.set(self.context)
         self.channel_set.set()
 
     def set_args(self, args: list[Any]):
@@ -122,27 +150,46 @@ class VideoCallback(VideoStreamTrack):
         self.thread_quit.set()
 
     async def wait_for_channel(self):
+        current_context.set(self.context)
         if not self.channel_set.is_set():
             await self.channel_set.wait()
         if current_channel.get() != self.channel:
             current_channel.set(self.channel)
 
-    async def recv(self):  # type: ignore
-        try:
+    async def accept_input(self):
+        self.has_started = True
+        while not self.thread_quit.is_set():
             try:
                 frame = cast(VideoFrame, await self.track.recv())
+                self.latest_frame = frame
+                self.frame_queue.put_nowait(frame)
             except MediaStreamError:
                 self.stop()
                 return
 
+    def accept_input_in_background(self):
+        if not self.has_started:
+            asyncio.create_task(self.accept_input())
+
+    async def recv(self):  # type: ignore
+        self.accept_input_in_background()
+        try:
+            frame = await self.frame_queue.get()
+            if self.skip_frames:
+                frame = self.latest_frame
             await self.wait_for_channel()
-            frame_array = frame.to_ndarray(format="bgr24")
+            frame_array = frame.to_ndarray(format="bgr24")  # type: ignore
             if self.latest_args == "not_set":
                 return frame
 
             args = self.add_frame_to_payload(cast(list, self.latest_args), frame_array)
-
             array, outputs = split_output(self.event_handler(*args))
+            if isinstance(outputs, CloseStream):
+                cast(DataChannel, self.channel).send(
+                    create_message("end_stream", outputs.msg)
+                )
+                self.stop()
+                return None
             if (
                 isinstance(outputs, AdditionalOutputs)
                 and self.set_additional_outputs
@@ -161,7 +208,6 @@ class VideoCallback(VideoStreamTrack):
                 pts, time_base = await self.next_timestamp()
                 new_frame.pts = pts
                 new_frame.time_base = time_base
-
             return new_frame
         except Exception as e:
             logger.debug("exception %s", e)
@@ -172,6 +218,21 @@ class VideoCallback(VideoStreamTrack):
             else:
                 raise WebRTCError(str(e)) from e
 
+    async def next_timestamp(self) -> Tuple[int, fractions.Fraction]:
+        """Override to control frame rate"""
+        if self.readyState != "live":
+            raise MediaStreamError
+
+        if hasattr(self, "_timestamp"):
+            self._timestamp += int(self.frame_ptime * VIDEO_CLOCK_RATE)
+            wait = self._start + (self._timestamp / VIDEO_CLOCK_RATE) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        else:
+            self._start = time.time()
+            self._timestamp = 0
+        return self._timestamp, VIDEO_TIME_BASE
+
 
 class StreamHandlerBase(ABC):
     def __init__(
@@ -180,11 +241,13 @@ class StreamHandlerBase(ABC):
         output_sample_rate: int = 24000,
         output_frame_size: int = 960,
         input_sample_rate: int = 48000,
+        fps: int = 30,
     ) -> None:
         self.expected_layout = expected_layout
         self.output_sample_rate = output_sample_rate
         self.output_frame_size = output_frame_size
         self.input_sample_rate = input_sample_rate
+        self.fps = fps
         self.latest_args: list[Any] = []
         self._resampler = None
         self._channel: DataChannel | None = None
@@ -353,10 +416,16 @@ VideoStreamHandlerImpl = AudioVideoStreamHandler | AsyncAudioVideoStreamHandler
 AudioVideoStreamHandlerImpl = AudioVideoStreamHandler | AsyncAudioVideoStreamHandler
 AsyncHandler = AsyncStreamHandler | AsyncAudioVideoStreamHandler
 
-HandlerType = StreamHandlerImpl | VideoStreamHandlerImpl | VideoEventHandler | Callable
+HandlerType = (
+    StreamHandlerImpl
+    | VideoStreamHandlerImpl
+    | VideoEventHandler
+    | Callable
+    | VideoStreamHandler
+)
 
 
-class VideoStreamHandler(VideoCallback):
+class VideoStreamHandler_(VideoCallback):
     async def process_frames(self):
         while not self.thread_quit.is_set():
             try:
@@ -393,6 +462,12 @@ class VideoStreamHandler(VideoCallback):
             ):
                 self.set_additional_outputs(outputs)
                 self.channel.send(create_message("fetch_output", []))
+            if isinstance(outputs, CloseStream):
+                cast(DataChannel, self.channel).send(
+                    create_message("end_stream", outputs.msg)
+                )
+                self.stop()
+                return
             if array is None and self.mode == "send":
                 return
 
@@ -417,6 +492,7 @@ class AudioCallback(AudioStreamTrack):
         self,
         track: MediaStreamTrack,
         event_handler: StreamHandlerBase,
+        context: Context,
         channel: DataChannel | None = None,
         set_additional_outputs: Callable | None = None,
     ) -> None:
@@ -433,6 +509,7 @@ class AudioCallback(AudioStreamTrack):
         self.last_timestamp = 0
         self.channel = channel
         self.set_additional_outputs = set_additional_outputs
+        self.context = context
 
     def clear_queue(self):
         logger.debug("clearing queue")
@@ -445,6 +522,7 @@ class AudioCallback(AudioStreamTrack):
         self._start = None
 
     async def wait_for_channel(self):
+        current_context.set(self.context)
         if not self.event_handler.channel_set.is_set():
             await self.event_handler.channel_set.wait()
         if current_channel.get() != self.event_handler.channel:
@@ -463,6 +541,7 @@ class AudioCallback(AudioStreamTrack):
 
     def event_handler_emit(self) -> EmitType:
         current_channel.set(self.event_handler.channel)
+        current_context.set(self.context)
         return cast(Callable, self.event_handler.emit)()
 
     async def process_input_frames(self) -> None:
@@ -535,6 +614,12 @@ class AudioCallback(AudioStreamTrack):
             await self.start()
 
             frame = await self.queue.get()
+            if isinstance(frame, CloseStream):
+                cast(DataChannel, self.channel).send(
+                    create_message("end_stream", frame.msg)
+                )
+                self.stop()
+                return
             logger.debug("frame %s", frame)
 
             data_time = frame.time
@@ -574,8 +659,10 @@ class ServerToClientVideo(VideoStreamTrack):
     def __init__(
         self,
         event_handler: Callable,
+        context: Context,
         channel: DataChannel | None = None,
         set_additional_outputs: Callable | None = None,
+        fps: int = 30,
     ) -> None:
         super().__init__()  # don't forget this!
         self.event_handler = event_handler
@@ -584,6 +671,9 @@ class ServerToClientVideo(VideoStreamTrack):
         self.generator: Generator[Any, None, Any] | None = None
         self.channel = channel
         self.set_additional_outputs = set_additional_outputs
+        self.fps = fps
+        self.frame_ptime = 1.0 / fps
+        self.context = context
 
     def array_to_frame(self, array: np.ndarray) -> VideoFrame:
         return VideoFrame.from_ndarray(array, format="bgr24")
@@ -595,17 +685,39 @@ class ServerToClientVideo(VideoStreamTrack):
         self.latest_args = list(args)
         self.args_set.set()
 
+    async def next_timestamp(self) -> Tuple[int, fractions.Fraction]:
+        """Override to control frame rate"""
+        if self.readyState != "live":
+            raise MediaStreamError
+
+        if hasattr(self, "_timestamp"):
+            self._timestamp += int(self.frame_ptime * VIDEO_CLOCK_RATE)
+            wait = self._start + (self._timestamp / VIDEO_CLOCK_RATE) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        else:
+            self._start = time.time()
+            self._timestamp = 0
+        return self._timestamp, VIDEO_TIME_BASE
+
     async def recv(self):  # type: ignore
         try:
             pts, time_base = await self.next_timestamp()
             await self.args_set.wait()
             current_channel.set(self.channel)
+            current_context.set(self.context)
             if self.generator is None:
                 self.generator = cast(
                     Generator[Any, None, Any], self.event_handler(*self.latest_args)
                 )
             try:
                 next_array, outputs = split_output(next(self.generator))
+                if isinstance(outputs, CloseStream):
+                    cast(DataChannel, self.channel).send(
+                        create_message("end_stream", outputs.msg)
+                    )
+                    self.stop()
+                    return
                 if (
                     isinstance(outputs, AdditionalOutputs)
                     and self.set_additional_outputs
@@ -637,6 +749,7 @@ class ServerToClientAudio(AudioStreamTrack):
     def __init__(
         self,
         event_handler: Callable,
+        context: Context,
         channel: DataChannel | None = None,
         set_additional_outputs: Callable | None = None,
     ) -> None:
@@ -652,6 +765,7 @@ class ServerToClientAudio(AudioStreamTrack):
         self.set_additional_outputs = set_additional_outputs
         self.has_started = False
         self._start: float | None = None
+        self.context = context
         super().__init__()
 
     def clear_queue(self):
@@ -667,6 +781,7 @@ class ServerToClientAudio(AudioStreamTrack):
         self.args_set.set()
 
     def next(self) -> tuple[int, np.ndarray] | None:
+        current_context.set(self.context)
         self.args_set.wait()
         current_channel.set(self.channel)
         if self.generator is None:
@@ -701,6 +816,12 @@ class ServerToClientAudio(AudioStreamTrack):
 
             await self.start()
             data = await self.queue.get()
+            if isinstance(data, CloseStream):
+                cast(DataChannel, self.channel).send(
+                    create_message("end_stream", data.msg)
+                )
+                self.stop()
+                return
             if data is None:
                 self.stop()
                 return

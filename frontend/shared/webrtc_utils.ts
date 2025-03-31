@@ -80,7 +80,8 @@ export async function start(
       event_json?.type === "error" ||
       event_json?.type === "send_input" ||
       event_json?.type === "fetch_output" ||
-      event_json?.type === "stopword"
+      event_json?.type === "stopword" ||
+      event_json?.type === "end_stream"
     ) {
       on_change_cb(event_json ?? event.data);
     }
@@ -129,28 +130,21 @@ async function negotiate(
   webrtc_id: string,
   reject_cb: (msg: object) => void = () => {},
 ): Promise<void> {
+  pc.onicecandidate = ({ candidate }) => {
+    if (candidate) {
+      console.debug("Sending ICE candidate", candidate);
+      server_fn({
+        candidate: candidate.toJSON(),
+        webrtc_id: webrtc_id,
+        type: "ice-candidate",
+      }).catch((err) => console.error("Error sending ICE candidate:", err));
+    }
+  };
+
   return pc
     .createOffer()
     .then((offer) => {
       return pc.setLocalDescription(offer);
-    })
-    .then(() => {
-      // wait for ICE gathering to complete
-      return new Promise<void>((resolve) => {
-        console.debug("ice gathering state", pc.iceGatheringState);
-        if (pc.iceGatheringState === "complete") {
-          resolve();
-        } else {
-          const checkState = () => {
-            if (pc.iceGatheringState === "complete") {
-              console.debug("ice complete");
-              pc.removeEventListener("icegatheringstatechange", checkState);
-              resolve();
-            }
-          };
-          pc.addEventListener("icegatheringstatechange", checkState);
-        }
-      });
     })
     .then(() => {
       var offer = pc.localDescription;
