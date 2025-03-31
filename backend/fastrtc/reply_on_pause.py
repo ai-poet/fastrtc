@@ -160,6 +160,7 @@ class ReplyOnPause(StreamHandler):
                     state.stream = np.concatenate((state.stream, audio))
             state.buffer = None
             if dur_vad < self.algo_options.speech_threshold and state.started_talking:
+                self.send_message_sync(create_message("log", "pause_detected"))
                 return True
         return False
 
@@ -183,7 +184,6 @@ class ReplyOnPause(StreamHandler):
             return
         self.process_audio(frame, self.state)
         if self.state.pause_detected:
-            self.send_message_sync(create_message("log", "pause_detected"))
             self.event.set()
 
     def _close_generator(self):
