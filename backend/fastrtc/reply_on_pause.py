@@ -115,6 +115,7 @@ class ReplyOnPause(StreamHandler):
             if self._needs_additional_inputs:
                 self.wait_for_args_sync()
                 args = self.latest_args[1:]
+                self.args_set.is_set()
             else:
                 args = ()
             self.generator = self.startup_fn(*args)
@@ -146,6 +147,7 @@ class ReplyOnPause(StreamHandler):
             if (
                 dur_vad > self.algo_options.started_talking_threshold
                 and not state.started_talking
+                and self.args_set.is_set()
             ):
                 state.started_talking = True
                 logger.debug("Started talking")
@@ -181,6 +183,7 @@ class ReplyOnPause(StreamHandler):
             return
         self.process_audio(frame, self.state)
         if self.state.pause_detected:
+            self.send_message_sync(create_message("log", "pause_detected"))
             self.event.set()
 
     def _close_generator(self):
@@ -219,7 +222,6 @@ class ReplyOnPause(StreamHandler):
             return None
         else:
             if not self.generator:
-                self.send_message_sync(create_message("log", "pause_detected"))
                 if self._needs_additional_inputs and not self.args_set.is_set():
                     if not self.phone_mode:
                         self.wait_for_args_sync()
