@@ -10,6 +10,7 @@ from .pause_detection import (
     get_silero_model,
 )
 from .reply_on_pause import AlgoOptions, ReplyOnPause
+from .reply_on_pause_audio_video import ReplyOnPauseAudioVideo
 from .reply_on_stopwords import ReplyOnStopWords
 from .speech_to_text import MoonshineSTT, get_stt_model
 from .stream import Stream, UIArgs
@@ -58,6 +59,7 @@ __all__ = [
     "get_twilio_turn_credentials",
     "get_turn_credentials",
     "ReplyOnPause",
+    "ReplyOnPauseAudioVideo",
     "ReplyOnStopWords",
     "SileroVadOptions",
     "get_stt_model",
